@@ -18,9 +18,12 @@ interface Message {
   userId: string;
   userName: string;
   content: string;
-  timestamp: Date;
+  timestamp: string | Date;
   type: 'emergency' | 'normal';
 }
+
+const MESSAGES_STORAGE_KEY = 'traffic_control_messages';
+const USER_STORAGE_KEY = 'traffic_control_user';
 
 const Index = () => {
   const [user, setUser] = useState<User | null>(null);
@@ -34,56 +37,152 @@ const Index = () => {
   const [isChatOpen, setIsChatOpen] = useState(true);
   const [allLocations, setAllLocations] = useState<any[]>([]);
 
+  // Load messages from localStorage on mount
+  useEffect(() => {
+    try {
+      const stored = localStorage.getItem(MESSAGES_STORAGE_KEY);
+      if (stored) {
+        const parsedMessages = JSON.parse(stored);
+        setMessages(parsedMessages);
+        console.log('📦 Loaded messages from localStorage:', parsedMessages.length);
+      }
+    } catch (error) {
+      console.error('❌ Error loading messages from localStorage:', error);
+    }
+  }, []);
+
+  // Listen for storage changes from other tabs
+  useEffect(() => {
+    const handleStorageChange = (event: StorageEvent) => {
+      if (event.key === MESSAGES_STORAGE_KEY && event.newValue) {
+        try {
+          const updatedMessages = JSON.parse(event.newValue);
+          setMessages(updatedMessages);
+          console.log('🔄 Messages synced from another tab:', updatedMessages.length);
+        } catch (error) {
+          console.error('❌ Error syncing messages:', error);
+        }
+      }
+    };
+
+    window.addEventListener('storage', handleStorageChange);
+    return () => window.removeEventListener('storage', handleStorageChange);
+  }, []);
+
+  // Save messages to localStorage whenever they change
+  useEffect(() => {
+    try {
+      localStorage.setItem(MESSAGES_STORAGE_KEY, JSON.stringify(messages));
+      console.log('💾 Saved messages to localStorage:', messages.length);
+    } catch (error) {
+      console.error('❌ Error saving messages to localStorage:', error);
+    }
+  }, [messages]);
+
   useEffect(() => {
     if (user) {
       const websocket = new WebSocket('ws://localhost:3001');
 
       websocket.onopen = () => {
-        console.log("WebSocket connected!");
+        console.log("✅ WebSocket connected!");
         websocket.send(JSON.stringify({
           type: 'connect',
+          userId: user.id,
           userName: user.name
         }));
       };
 
       websocket.onmessage = (event) => {
         const data = JSON.parse(event.data);
-        console.log("WebSocket message received:", data);
+        console.log("📨 WebSocket message received:", data.type);
+        
         switch (data.type) {
+          // Initial connection data
+          case 'init':
+            console.log('✅ Server init: loaded', data.messageHistory?.length, 'messages');
+            setMessages(data.messageHistory || []);
+            localStorage.setItem(MESSAGES_STORAGE_KEY, JSON.stringify(data.messageHistory || []));
+            break;
+
+          // Confirmation after connecting
           case 'connected':
             setUser(prev => ({ ...prev!, id: data.userId }));
-            setMessages(data.messages);
+            setMessages(data.messageHistory || []);
+            localStorage.setItem(MESSAGES_STORAGE_KEY, JSON.stringify(data.messageHistory || []));
+            setConnectedUsers((data.users || []).map((u: any) => ({ id: u.userId, name: u.userName })));
+            console.log('✅ Connected with ID:', data.userId);
             break;
-          case 'userList':
-            // data.users = [{ userId, userName }, ...]
-            setConnectedUsers((data.users || []).map((u: { userId: string; userName: string }) => ({ id: u.userId, name: u.userName })));
+
+          // New chat message from another user
+          case 'chatMessage':
+            setMessages(prev => {
+              const updated = [...prev, data.message];
+              localStorage.setItem(MESSAGES_STORAGE_KEY, JSON.stringify(updated));
+              return updated;
+            });
+            console.log(`💬 Chat from ${data.message.userName}`);
             break;
-          case 'locations':
-            // data.locations = [{ userId, userName, location: { latitude, longitude, accuracy, timestamp } }, ...]
-            setAllLocations(data.locations || []);
+
+          // User joined notification
+          case 'userJoined':
+            setConnectedUsers(data.users || [].map((u: any) => ({ id: u.userId, name: u.userName })));
+            console.log(`👤 ${data.userName} joined`);
             break;
-          case 'newMessage':
-            setMessages(prev => [...prev, data.message]);
+
+          // User left notification
+          case 'userLeft':
+            setConnectedUsers(data.users || [].map((u: any) => ({ id: u.userId, name: u.userName })));
+            console.log(`👋 ${data.userName} left`);
             break;
+
+          // Emergency alert
           case 'emergency':
-            setMessages(prev => [...prev, data.message]);
+            setMessages(prev => {
+              const updated = [...prev, data.message];
+              localStorage.setItem(MESSAGES_STORAGE_KEY, JSON.stringify(updated));
+              return updated;
+            });
             setIsEmergencyActive(true);
             setEmergencyCountdown(30);
-            // Trigger voice announcement for all users
             playEmergencyVoice();
+            console.log('🚨 EMERGENCY ALERT!');
             break;
-          case 'trafficUpdate':
-            // Handle traffic update if needed
+
+          // Location update
+          case 'locationUpdate':
+            setAllLocations(prev => {
+              const updated = prev.filter(u => u.userId !== data.userId);
+              updated.push({
+                userId: data.userId,
+                userName: data.userName,
+                location: data.location
+              });
+              return updated;
+            });
+            console.log(`📍 ${data.userName} updated location`);
             break;
+
+          // User typing indicator
+          case 'userTyping':
+            console.log(`✍️ ${data.userName} ${data.isTyping ? 'is typing...' : 'stopped typing'}`);
+            break;
+
+          // Error message
+          case 'error':
+            console.error('❌ Server error:', data.message);
+            break;
+
+          default:
+            console.warn('⚠️ Unknown message type:', data.type);
         }
       };
 
       websocket.onerror = (error) => {
-        console.error("WebSocket error:", error);
+        console.error("❌ WebSocket error:", error);
       };
 
       websocket.onclose = () => {
-        console.log("WebSocket disconnected!");
+        console.log("❌ WebSocket disconnected!");
       };
 
       setWs(websocket);
@@ -127,25 +226,33 @@ const Index = () => {
 
   const handleSendMessage = (content: string) => {
     if (ws && user && content.trim()) {
+      if (ws.readyState !== 1) {
+        console.error('❌ WebSocket not connected');
+        return;
+      }
+
       const messagePayload = {
-        type: 'message',
-        userId: user.id,
+        type: 'chat',
         content: content.trim()
       };
-      console.log("Sending message:", messagePayload);
+      console.log("💬 Sending chat message:", content);
       ws.send(JSON.stringify(messagePayload));
       setNewMessage("");
 
       // Add local message immediately for better UX
-      const newMsg = {
-        id: Date.now().toString(),
+      const newMsg: Message = {
+        id: `msg_${Date.now()}`,
         userId: user.id,
         userName: user.name,
         content: content.trim(),
-        timestamp: new Date(),
+        timestamp: new Date().toISOString(),
         type: 'normal' as const
       };
-      setMessages(prev => [...prev, newMsg]);
+      setMessages(prev => {
+        const updated = [...prev, newMsg];
+        localStorage.setItem(MESSAGES_STORAGE_KEY, JSON.stringify(updated));
+        return updated;
+      });
     }
   };
 
@@ -168,35 +275,51 @@ const Index = () => {
     try {
       window.speechSynthesis.cancel();
       
-      const utterance = new SpeechSynthesisUtterance(
-        "Attention! Emergency ambulance is coming. Please clear the traffic immediately."
-      );
+      const text = "Attention! Emergency ambulance is coming. Please clear the traffic immediately.";
+      const utterance = new SpeechSynthesisUtterance(text);
       
       utterance.rate = 0.9;
       utterance.pitch = 1.8;
       utterance.volume = 1.0;
       
       const voices = window.speechSynthesis.getVoices();
+      console.log(`🔊 Available voices for emergency: ${voices.length}`);
       
       if (voices.length > 0) {
-        const femaleVoice = voices.find(v => 
-          v.name.toLowerCase().includes('female') || 
-          v.name.toLowerCase().includes('woman') || 
-          v.name.includes('Zira') ||
-          v.name.includes('Victoria') ||
-          v.name.includes('Samantha')
-        );
+        const femaleVoice = voices.find(v => {
+          const name = v.name.toLowerCase();
+          return (
+            name.includes('female') || 
+            name.includes('woman') ||
+            name.includes('zira') ||
+            name.includes('victoria') ||
+            name.includes('samantha') ||
+            name.includes('google us english female')
+          );
+        }) || voices[Math.min(1, voices.length - 1)]; // Fallback
         
         if (femaleVoice) {
           utterance.voice = femaleVoice;
-        } else if (voices.length > 1) {
-          utterance.voice = voices[1];
+          console.log(`🎤 Emergency voice: ${femaleVoice.name}`);
         }
       }
+
+      utterance.onstart = () => {
+        console.log('🔊 Emergency voice started');
+      };
+
+      utterance.onerror = (event) => {
+        console.error('❌ Emergency voice error:', event.error);
+      };
+
+      utterance.onend = () => {
+        console.log('🔊 Emergency voice ended');
+      };
       
       window.speechSynthesis.speak(utterance);
+      console.log('🚨 Emergency voice alert playing');
     } catch (error) {
-      console.error("Voice error:", error);
+      console.error("❌ Voice error:", error);
     }
   };
 

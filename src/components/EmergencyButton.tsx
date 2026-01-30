@@ -9,64 +9,86 @@ interface EmergencyButtonProps {
 
 export const EmergencyButton = ({ onActivate, isActive, countdown }: EmergencyButtonProps) => {
   const intervalRef = useRef<NodeJS.Timeout | null>(null);
+  const utteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
 
   const playLadyVoiceAlert = () => {
     try {
-      // Stop any previous speech
+      // Stop previous speech
       window.speechSynthesis.cancel();
       
-      const utterance = new SpeechSynthesisUtterance(
-        "Attention! Emergency ambulance is coming. Please clear the traffic immediately."
-      );
+      const text = "Attention! Emergency ambulance is coming. Please clear the traffic immediately.";
+      utteranceRef.current = new SpeechSynthesisUtterance(text);
       
-      utterance.rate = 0.9;
-      utterance.pitch = 1.8;
-      utterance.volume = 1.0;
+      utteranceRef.current.rate = 0.9;
+      utteranceRef.current.pitch = 1.8;
+      utteranceRef.current.volume = 1.0;
       
-      // Wait for voices to load if not already available
+      // Get available voices
       const voices = window.speechSynthesis.getVoices();
+      console.log(`🔊 Available voices: ${voices.length}`);
       
       if (voices.length > 0) {
-        // Look for female voice first
-        const femaleVoice = voices.find(v => 
-          v.name.toLowerCase().includes('female') || 
-          v.name.toLowerCase().includes('woman') || 
-          v.name.includes('Zira') ||
-          v.name.includes('Victoria') ||
-          v.name.includes('Samantha') ||
-          v.lang.includes('en-US') && v.name.includes('Google')
-        );
+        // Try to find female voice
+        const femaleVoice = voices.find(v => {
+          const name = v.name.toLowerCase();
+          return (
+            name.includes('female') || 
+            name.includes('woman') ||
+            name.includes('zira') ||
+            name.includes('victoria') ||
+            name.includes('samantha') ||
+            name.includes('google us english female')
+          );
+        }) || voices[Math.min(1, voices.length - 1)]; // Fallback to second voice
         
         if (femaleVoice) {
-          utterance.voice = femaleVoice;
-        } else if (voices.length > 1) {
-          // Use second voice as fallback (often female)
-          utterance.voice = voices[1];
+          utteranceRef.current.voice = femaleVoice;
+          console.log(`🎤 Using voice: ${femaleVoice.name}`);
         }
       }
-      
-      console.log("Playing voice alert...", utterance.voice?.name);
-      window.speechSynthesis.speak(utterance);
+
+      utteranceRef.current.onstart = () => {
+        console.log('🔊 Voice alert started');
+      };
+
+      utteranceRef.current.onerror = (event) => {
+        console.error('❌ Speech synthesis error:', event.error);
+      };
+
+      utteranceRef.current.onend = () => {
+        console.log('🔊 Voice alert ended');
+      };
+
+      window.speechSynthesis.speak(utteranceRef.current);
+      console.log('🚨 Playing emergency voice alert');
     } catch (error) {
-      console.error("Voice error:", error);
+      console.error("❌ Voice error:", error);
     }
   };
 
   // Load voices on mount
   useEffect(() => {
     const loadVoices = () => {
-      window.speechSynthesis.getVoices();
+      const voices = window.speechSynthesis.getVoices();
+      console.log(`🔊 Voices loaded: ${voices.length}`);
     };
     
-    if (window.speechSynthesis.onvoiceschanged !== undefined) {
-      window.speechSynthesis.onvoiceschanged = loadVoices;
-    }
+    window.speechSynthesis.onvoiceschanged = loadVoices;
+    loadVoices(); // Try loading immediately too
+    
+    return () => {
+      window.speechSynthesis.onvoiceschanged = null;
+    };
   }, []);
 
   useEffect(() => {
     if (isActive) {
-      // Play immediately
-      setTimeout(() => playLadyVoiceAlert(), 100);
+      console.log('🚨 Emergency activated! Playing voice...');
+      
+      // Play immediately with a small delay to ensure voices are loaded
+      const delay = setTimeout(() => {
+        playLadyVoiceAlert();
+      }, 100);
       
       // Repeat every 5 seconds
       intervalRef.current = setInterval(() => {
@@ -74,6 +96,7 @@ export const EmergencyButton = ({ onActivate, isActive, countdown }: EmergencyBu
       }, 5000);
       
       return () => {
+        clearTimeout(delay);
         if (intervalRef.current) {
           clearInterval(intervalRef.current);
         }
@@ -89,7 +112,7 @@ export const EmergencyButton = ({ onActivate, isActive, countdown }: EmergencyBu
       size="lg"
       className={`text-white font-bold shadow-2xl transition-all text-sm ${
         isActive
-          ? 'bg-red-600/50 cursor-not-allowed'
+          ? 'bg-red-600/50 cursor-not-allowed animate-pulse'
           : 'bg-gradient-to-r from-red-600 to-red-700 hover:from-red-700 hover:to-red-800 hover:scale-105'
       }`}
     >

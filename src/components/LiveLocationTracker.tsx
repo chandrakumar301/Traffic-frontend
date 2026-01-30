@@ -17,51 +17,19 @@ interface LiveLocationTrackerProps {
 }
 
 const LiveLocationTracker = ({ onLocationUpdate, ws, userId, allLocations = [] }: LiveLocationTrackerProps) => {
-  const [status, setStatus] = useState('Waiting for location permission...');
+  const [status, setStatus] = useState('🔍 Requesting location permission...');
   const [location, setLocation] = useState<Location | null>(null);
   const [map, setMap] = useState<L.Map | null>(null);
+  const [locationEnabled, setLocationEnabled] = useState(false);
   const mapRef = React.useRef<HTMLDivElement>(null);
   const markerRef = React.useRef<L.Marker | null>(null);
   const accuracyCircleRef = React.useRef<L.Circle | null>(null);
   const otherMarkersRef = React.useRef<Map<string, L.Marker>>(new Map());
+  const watchIdRef = React.useRef<number | null>(null);
 
-  useEffect(() => {
-    if (!navigator.geolocation) {
-      setStatus('Geolocation is not supported by your browser.');
-      return;
-    }
-
-    // Initialize map
-    if (mapRef.current && !map) {
-      const newMap = L.map(mapRef.current).setView([20, 0], 13);
-      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-        attribution: '© OpenStreetMap contributors',
-      }).addTo(newMap);
-      setMap(newMap);
-    }
-
-    // Get location
-    navigator.geolocation.getCurrentPosition(
-      success,
-      error,
-      { enableHighAccuracy: true }
-    );
-
-    // Watch position for continuous updates
-    const watchId = navigator.geolocation.watchPosition(
-      success,
-      error,
-      { enableHighAccuracy: true, maximumAge: 0 }
-    );
-
-    return () => navigator.geolocation.clearWatch(watchId);
-  }, []);
-
-  // Simple in-memory cache for reverse geocoding results to reduce external requests.
-  // Key is rounded lat|lon to 4 decimals (~11m precision). TTL defaults to 24h.
+  // Simple in-memory cache for reverse geocoding
   const GEOCODE_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
   const geocodeCache: Map<string, { area: string | null; ts: number }> = (globalThis as any).__geocodeCache || new Map();
-  // persist map across HMR reloads in dev
   (globalThis as any).__geocodeCache = geocodeCache;
 
   const reverseGeocode = async (lat: number, lon: number) => {
@@ -76,11 +44,10 @@ const LiveLocationTracker = ({ onLocationUpdate, ws, userId, allLocations = [] }
       const res = await fetch(url, {
         headers: {
           'Accept-Language': 'en',
-          'User-Agent': 'Traffic-Control-App/1.0 (your-email@example.com)'
+          'User-Agent': 'Traffic-Control-App/1.0'
         },
       });
       if (!res.ok) {
-        // store negative cache to avoid repeated failing calls
         geocodeCache.set(key, { area: null, ts: Date.now() });
         return null;
       }
@@ -90,21 +57,22 @@ const LiveLocationTracker = ({ onLocationUpdate, ws, userId, allLocations = [] }
 
       geocodeCache.set(key, { area, ts: Date.now() });
       return area;
-    } catch (e) {
+    } catch (error) {
+      console.error('❌ Reverse geocoding error:', error);
       return null;
     }
   };
 
   const success = async (position: GeolocationPosition) => {
     const { latitude, longitude, accuracy } = position.coords;
+    console.log('✅ Location acquired:', { latitude, longitude, accuracy });
 
     let newLocation: Location = { latitude, longitude, accuracy, areaName: null };
     setLocation(newLocation);
-    setStatus(
-      `Location found (Accuracy: ${Math.round(accuracy)}m). Sharing location...`
-    );
+    setLocationEnabled(true);
+    setStatus(`✅ Location found (Accuracy: ${Math.round(accuracy)}m)`);
 
-    // Try reverse geocoding (best-effort)
+    // Reverse geocoding
     const area = await reverseGeocode(latitude, longitude);
     if (area) {
       newLocation = { ...newLocation, areaName: area };
@@ -115,9 +83,9 @@ const LiveLocationTracker = ({ onLocationUpdate, ws, userId, allLocations = [] }
       onLocationUpdate(newLocation);
     }
 
-    // Send location to server via WebSocket if available
-    try {
-      if (ws && userId) {
+    // Send location via WebSocket
+    if (ws && userId && ws.readyState === 1) {
+      try {
         ws.send(
           JSON.stringify({
             type: 'location',
@@ -128,46 +96,86 @@ const LiveLocationTracker = ({ onLocationUpdate, ws, userId, allLocations = [] }
             areaName: newLocation.areaName || null,
           }),
         );
+        console.log('📍 Location sent to server');
+      } catch (error) {
+        console.error('❌ Failed to send location:', error);
       }
-    } catch (e) {
-      // ignore send errors
     }
 
+    // Update map
     if (map) {
       map.setView([latitude, longitude], 16);
 
-      // Update or create marker
+      // Update marker
       if (markerRef.current) {
         markerRef.current.setLatLng([latitude, longitude]);
-        markerRef.current.setPopupContent(`📍 You\n${newLocation.areaName || `${latitude.toFixed(5)}, ${longitude.toFixed(5)}`}`);
       } else {
-        markerRef.current = L.marker([latitude, longitude])
+        markerRef.current = L.marker([latitude, longitude], {
+          title: 'Your Location'
+        })
           .addTo(map)
-          .bindPopup(`📍 You\n${newLocation.areaName || `${latitude.toFixed(5)}, ${longitude.toFixed(5)}`}`)
-          .openPopup();
+          .bindPopup(`📍 You<br/>${newLocation.areaName || `${latitude.toFixed(5)}, ${longitude.toFixed(5)}`}`);
       }
 
-      // Add or update accuracy circle
+      // Update accuracy circle
       if (accuracyCircleRef.current) {
-        accuracyCircleRef.current.setLatLng([latitude, longitude]);
-        accuracyCircleRef.current.setRadius(accuracy);
+        accuracyCircleRef.current.setLatLng([latitude, longitude]).setRadius(accuracy);
       } else {
         accuracyCircleRef.current = L.circle([latitude, longitude], {
           radius: accuracy,
-          color: '#3b82f6',
-          fillColor: '#93c5fd',
-          fillOpacity: 0.2,
-          weight: 2,
+          color: 'blue',
+          fillColor: '#30b0d0',
+          fillOpacity: 0.1,
         }).addTo(map);
       }
     }
   };
 
-  const error = () => {
-    setStatus('Location access denied. Please turn ON GPS.');
+  const error = (err: GeolocationPositionError) => {
+    const errorMessages: { [key: number]: string } = {
+      1: '❌ Permission denied. Please enable location access in browser settings.',
+      2: '❌ Position unavailable. Try moving to a location with better signal.',
+      3: '❌ Request timed out. Please try again.',
+    };
+    const message = errorMessages[err.code] || `❌ Error: ${err.message}`;
+    console.error('Geolocation error:', message);
+    setStatus(message);
   };
 
-  // Update markers for other users when allLocations prop changes
+  useEffect(() => {
+    if (!navigator.geolocation) {
+      setStatus('❌ Geolocation not supported');
+      return;
+    }
+
+    // Initialize map
+    if (mapRef.current && !map) {
+      const newMap = L.map(mapRef.current).setView([20, 0], 13);
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '© OpenStreetMap contributors',
+      }).addTo(newMap);
+      setMap(newMap);
+      console.log('🗺️ Map initialized');
+    }
+
+    // Request location
+    console.log('📡 Requesting geolocation...');
+    navigator.geolocation.getCurrentPosition(
+      success,
+      error,
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+    );
+
+    // Watch position continuously
+    watchIdRef.current = navigator.geolocation.watchPosition(
+      success,
+      error,
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+    );
+
+  }, [map]);
+
+  // Update markers for other users
   useEffect(() => {
     if (!map) return;
 
@@ -177,8 +185,7 @@ const LiveLocationTracker = ({ onLocationUpdate, ws, userId, allLocations = [] }
     allLocations.forEach((entry) => {
       const { userId: uid, userName, location } = entry;
       if (!uid || !location) return;
-      // skip own marker
-      if (uid === userId) return;
+      if (uid === userId) return; // Skip own marker
 
       seen.add(uid);
 
@@ -190,13 +197,16 @@ const LiveLocationTracker = ({ onLocationUpdate, ws, userId, allLocations = [] }
         m.setLatLng([lat, lon]);
       } else {
         const m = L.marker([lat, lon], {
-          icon: L.divIcon({ className: 'bg-white/80 text-sm p-1 rounded shadow', html: `<div style="padding:6px 8px;border-radius:6px;background:rgba(255,255,255,0.9);">${userName||'User'}</div>` })
-        }).addTo(map).bindPopup(`${userName || 'User'}`);
+          icon: L.divIcon({ 
+            className: 'custom-marker',
+            html: `<div style="padding:6px 8px;border-radius:6px;background:rgba(59,130,246,0.9);color:white;font-size:12px;font-weight:bold;box-shadow:0 2px 4px rgba(0,0,0,0.3);">${userName||'User'}</div>`
+          })
+        }).addTo(map).bindPopup(`<b>${userName || 'User'}</b><br/>${location.latitude.toFixed(5)}, ${location.longitude.toFixed(5)}`);
         currentMarkers.set(uid, m);
       }
     });
 
-    // remove markers for users not in the latest list
+    // Remove markers for users no longer in list
     Array.from(currentMarkers.keys()).forEach((k) => {
       if (!seen.has(k)) {
         const m = currentMarkers.get(k)!;
@@ -214,24 +224,12 @@ const LiveLocationTracker = ({ onLocationUpdate, ws, userId, allLocations = [] }
           <span className="text-2xl">📍</span>
           <h2 className="text-xl font-bold">Live GPS Location Tracker</h2>
         </div>
-        <div
-          className={`text-sm font-semibold ${
-            status.includes('denied')
-              ? 'text-red-200'
-              : status.includes('found')
-              ? 'text-green-200'
-              : 'text-cyan-200'
-          }`}
-        >
+        <div className={`text-sm font-semibold ${status.includes('❌') ? 'text-red-300' : 'text-green-300'}`}>
           {status}
         </div>
         {location && (
-          <div className="text-xs text-cyan-100 mt-2">
-            <span>Lat: {location.latitude.toFixed(6)}</span>
-            <span className="mx-2">•</span>
-            <span>Lon: {location.longitude.toFixed(6)}</span>
-            <span className="mx-2">•</span>
-            <span>Accuracy: {Math.round(location.accuracy)}m</span>
+          <div className="text-xs mt-2 text-cyan-100">
+            📌 {location.areaName || `${location.latitude.toFixed(5)}, ${location.longitude.toFixed(5)}`} (±{Math.round(location.accuracy)}m)
           </div>
         )}
       </div>
