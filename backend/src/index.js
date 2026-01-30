@@ -4,197 +4,317 @@ import { WebSocketServer } from "ws";
 import { createServer } from "http";
 import { getTrafficStatus, setDensity } from "./speedPrediction.js";
 
-// Store connected users and their WebSocket connections
-const users = new Map();
-const messages = [];
-
-// Generate a unique ID
-const generateId = () => Math.random().toString(36).substr(2, 9);
-
+// ============ DATA STRUCTURES ============
 const app = express();
-const port = process.env.PORT || 3001; // ✅ Use Render's PORT or fallback
+const port = process.env.PORT || 3001;
+const server = createServer(app);
 
+// Store connected users: Map<userId, {ws, userName, location, connectedAt}>
+const connectedUsers = new Map();
+
+// Store all messages in memory (max 1000)
+const messageHistory = [];
+const MAX_MESSAGES = 1000;
+
+// Get initial traffic status
+let trafficData = getTrafficStatus();
+
+// ============ MIDDLEWARE ============
 app.use(cors());
 app.use(express.json());
 
-// Create HTTP server instance
-const server = createServer(app);
-
-// Create WebSocket server with the same HTTP server
+// ============ WEBSOCKET SERVER ============
 const wss = new WebSocketServer({
   server,
   perMessageDeflate: false,
   clientTracking: true,
 });
 
-// Get initial traffic status
-let trafficData = getTrafficStatus();
-
-// Helper to broadcast user list to all clients
-const broadcastUserList = () => {
-  const list = Array.from(users.entries()).map(([id, info]) => ({
-    userId: id,
-    userName: info.userName,
-  }));
-  users.forEach(({ ws: userWs }) => {
-    try {
-      userWs.send(JSON.stringify({ type: "userList", users: list }));
-    } catch (e) {}
+// Helper: Send message to all connected clients
+const broadcastToAll = (payload) => {
+  const message = JSON.stringify(payload);
+  wss.clients.forEach((client) => {
+    if (client.readyState === 1) {
+      // OPEN
+      try {
+        client.send(message);
+      } catch (error) {
+        console.error("❌ Broadcast error:", error.message);
+      }
+    }
   });
 };
 
-// Helper to broadcast all users' locations to clients
-const broadcastLocations = () => {
-  const locations = Array.from(users.entries()).map(([id, info]) => ({
-    userId: id,
-    userName: info.userName,
-    location: info.location || null,
-  }));
-  users.forEach(({ ws: userWs }) => {
-    try {
-      userWs.send(JSON.stringify({ type: "locations", locations }));
-    } catch (e) {}
-  });
+// Helper: Add message to history
+const addMessageToHistory = (msg) => {
+  messageHistory.push(msg);
+  if (messageHistory.length > MAX_MESSAGES) {
+    messageHistory.shift();
+  }
+  return msg;
 };
 
-// WebSocket connection handler
+// Helper: Get connected users list
+const getConnectedUsersList = () => {
+  return Array.from(connectedUsers.values()).map((user) => ({
+    userId: user.id,
+    userName: user.userName,
+    connectedAt: user.connectedAt,
+  }));
+};
+
+// ============ WEBSOCKET CONNECTION HANDLER ============
 wss.on("connection", (ws) => {
-  console.log("New client connected, total connections:", wss.clients.size);
-  let assignedId = null;
+  console.log(`\n✅ NEW CONNECTION - Total clients: ${wss.clients.size}`);
+  let userId = null;
 
-  // Send initial traffic data
-  ws.send(JSON.stringify({ type: "trafficUpdate", data: trafficData }));
+  // Send initial data on connection
+  if (ws.readyState === 1) {
+    ws.send(
+      JSON.stringify({
+        type: "init",
+        messageHistory: messageHistory.slice(-50), // Send last 50 messages
+        users: getConnectedUsersList(),
+        traffic: trafficData,
+      }),
+    );
+  }
 
-  // Handle incoming messages
-  ws.on("message", (data) => {
-    let message;
+  // ============ MESSAGE HANDLER ============
+  ws.on("message", (rawData) => {
+    let data;
     try {
-      message = JSON.parse(data.toString());
-    } catch (e) {
+      data = JSON.parse(rawData.toString());
+    } catch (error) {
+      console.error("❌ Parse error:", error.message);
       return;
     }
 
-    switch (message.type) {
-      case "connect": {
-        const userId = generateId();
-        assignedId = userId;
-        users.set(userId, { ws, userName: message.userName, location: null });
+    console.log(`📨 Message type: ${data.type}`);
 
+    switch (data.type) {
+      // ========== USER CONNECT ==========
+      case "connect": {
+        userId = data.userId || `user_${Date.now()}`;
+        const userInfo = {
+          id: userId,
+          ws,
+          userName: data.userName || `Guest_${userId.slice(-4)}`,
+          location: null,
+          connectedAt: new Date().toISOString(),
+        };
+        connectedUsers.set(userId, userInfo);
+
+        // Send connected confirmation
         ws.send(
           JSON.stringify({
             type: "connected",
             userId,
-            messages: messages.slice(-50),
-          })
+            messageHistory: messageHistory.slice(-50),
+            users: getConnectedUsersList(),
+          }),
         );
 
-        broadcastUserList();
-        broadcastLocations();
-        break;
-      }
+        console.log(`👤 User connected: ${userInfo.userName} (${userId})`);
 
-      case "message": {
-        const sender = users.get(message.userId);
-        if (!sender) break;
-        const newMessage = {
-          id: generateId(),
-          userId: message.userId,
-          userName: sender.userName,
-          content: message.content,
-          timestamp: new Date(),
-          type: message.messageType || "normal",
-        };
-        messages.push(newMessage);
-        users.forEach(({ ws: userWs }) => {
-          try {
-            userWs.send(JSON.stringify({ type: "newMessage", message: newMessage }));
-          } catch (e) {}
+        // Notify all other users
+        broadcastToAll({
+          type: "userJoined",
+          userId,
+          userName: userInfo.userName,
+          users: getConnectedUsersList(),
         });
+
         break;
       }
 
+      // ========== CHAT MESSAGE ==========
+      case "chat": {
+        if (!userId) {
+          ws.send(
+            JSON.stringify({
+              type: "error",
+              message: "Not connected. Please reconnect.",
+            }),
+          );
+          break;
+        }
+
+        const user = connectedUsers.get(userId);
+        if (!user) break;
+
+        const chatMsg = {
+          id: `msg_${Date.now()}`,
+          userId,
+          userName: user.userName,
+          content: data.content,
+          timestamp: new Date().toISOString(),
+          type: "chat",
+        };
+
+        addMessageToHistory(chatMsg);
+        console.log(`💬 Chat from ${user.userName}: ${data.content}`);
+
+        broadcastToAll({
+          type: "chatMessage",
+          message: chatMsg,
+        });
+
+        break;
+      }
+
+      // ========== EMERGENCY ALERT ==========
       case "emergency": {
-        const sender = users.get(message.userId);
-        if (!sender) break;
-        const emergencyMessage = {
-          id: generateId(),
-          userId: message.userId,
-          userName: sender.userName,
+        if (!userId) break;
+
+        const user = connectedUsers.get(userId);
+        if (!user) break;
+
+        const emergencyMsg = {
+          id: `emergency_${Date.now()}`,
+          userId,
+          userName: user.userName,
           content: "🚨 EMERGENCY ALERT: Traffic stopped for emergency vehicle",
-          timestamp: new Date(),
+          timestamp: new Date().toISOString(),
           type: "emergency",
         };
-        messages.push(emergencyMessage);
+
+        addMessageToHistory(emergencyMsg);
         trafficData = getTrafficStatus();
-        users.forEach(({ ws: userWs }) => {
-          try {
-            userWs.send(
-              JSON.stringify({
-                type: "emergency",
-                message: emergencyMessage,
-                trafficData,
-              })
-            );
-          } catch (e) {}
+
+        console.log(`🚨 EMERGENCY from ${user.userName}!`);
+
+        broadcastToAll({
+          type: "emergency",
+          message: emergencyMsg,
+          traffic: trafficData,
         });
+
         break;
       }
 
+      // ========== LOCATION UPDATE ==========
       case "location": {
-        const sender = users.get(message.userId);
-        if (!sender) break;
-        const loc = {
-          latitude: message.latitude,
-          longitude: message.longitude,
-          accuracy: message.accuracy || 0,
-          timestamp: new Date(),
+        if (!userId) break;
+
+        const user = connectedUsers.get(userId);
+        if (!user) break;
+
+        user.location = {
+          latitude: data.latitude,
+          longitude: data.longitude,
+          accuracy: data.accuracy,
+          areaName: data.areaName,
+          timestamp: new Date().toISOString(),
         };
-        users.set(message.userId, { ...sender, location: loc });
-        broadcastLocations();
+
+        console.log(
+          `📍 Location: ${user.userName} at ${data.areaName || `${data.latitude}, ${data.longitude}`}`,
+        );
+
+        broadcastToAll({
+          type: "locationUpdate",
+          userId,
+          userName: user.userName,
+          location: user.location,
+        });
+
+        break;
+      }
+
+      // ========== TYPING INDICATOR ==========
+      case "typing": {
+        if (!userId) break;
+        const user = connectedUsers.get(userId);
+        if (!user) break;
+
+        broadcastToAll({
+          type: "userTyping",
+          userId,
+          userName: user.userName,
+          isTyping: data.isTyping,
+        });
+
         break;
       }
 
       default:
-        break;
+        console.warn(`⚠️ Unknown message type: ${data.type}`);
     }
   });
 
+  // ============ CONNECTION CLOSE ==========
   ws.on("close", () => {
-    console.log("Client disconnected");
-    if (assignedId && users.has(assignedId)) {
-      const user = users.get(assignedId);
-      users.delete(assignedId);
-      broadcastUserList();
+    if (userId && connectedUsers.has(userId)) {
+      const user = connectedUsers.get(userId);
+      console.log(`👋 User disconnected: ${user.userName}`);
+
+      connectedUsers.delete(userId);
+
+      broadcastToAll({
+        type: "userLeft",
+        userId,
+        userName: user.userName,
+        users: getConnectedUsersList(),
+      });
+    }
+
+    console.log(`❌ Connection closed - Remaining: ${wss.clients.size}`);
+  });
+
+  // ============ ERROR HANDLER ==========
+  ws.on("error", (error) => {
+    console.error(`❌ WebSocket error: ${error.message}`);
+    if (userId && connectedUsers.has(userId)) {
+      connectedUsers.delete(userId);
     }
   });
 
-  const interval = setInterval(() => {
-    trafficData = getTrafficStatus();
-    try {
-      ws.send(JSON.stringify({ type: "trafficUpdate", data: trafficData }));
-    } catch (e) {}
-  }, 1000);
-
-  ws.on("error", (error) => {
-    console.error("WebSocket error:", error);
-    clearInterval(interval);
+  // ============ HEARTBEAT (keep-alive) ==========
+  ws.isAlive = true;
+  ws.on("pong", () => {
+    ws.isAlive = true;
   });
 });
 
-// REST endpoints
-app.get("/api/traffic", (req, res) => res.json(trafficData));
+// Heartbeat interval to detect stale connections
+const heartbeatInterval = setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (!ws.isAlive) {
+      ws.terminate();
+      return;
+    }
+    ws.isAlive = false;
+    ws.ping();
+  });
+}, 30000); // Every 30 seconds
 
-app.post("/api/traffic/:direction/maxSpeed", (req, res) => {
-  const { direction } = req.params;
-  const { maxSpeed } = req.body;
-  if (trafficData[direction]) {
-    trafficData[direction].maxSpeed = maxSpeed;
-    res.json({ success: true, data: trafficData[direction] });
-  } else {
-    res.status(400).json({ success: false, message: "Invalid direction" });
-  }
+// ============ REST ENDPOINTS ============
+
+// Get all messages
+app.get("/api/messages", (req, res) => {
+  res.json({
+    success: true,
+    messages: messageHistory.slice(-100),
+    count: messageHistory.length,
+  });
 });
 
+// Get connected users
+app.get("/api/users", (req, res) => {
+  res.json({
+    success: true,
+    users: getConnectedUsersList(),
+    count: connectedUsers.size,
+  });
+});
+
+// Get traffic status
+app.get("/api/traffic", (req, res) => {
+  res.json(trafficData);
+});
+
+// Update traffic density
 app.post("/api/density/:direction", (req, res) => {
   const { direction } = req.params;
   const { density } = req.body;
@@ -207,46 +327,66 @@ app.post("/api/density/:direction", (req, res) => {
   }
 });
 
+// AI Assistant endpoint
 app.post("/api/assistant", (req, res) => {
-  const { prompt, userId } = req.body || {};
-  const status = getTrafficStatus();
+  try {
+    const { prompt } = req.body || {};
+    const status = getTrafficStatus();
 
-  let lines = [];
-  let suggestions = [];
+    let lines = [];
+    let suggestions = [];
 
-  Object.entries(status).forEach(([dir, info]) => {
-    const density = info.density || 0;
-    const vols = info.volumes || { total: 0, first: 0, second: 0 };
-    const firstETA = info.firstGroup.estimatedTimeToReach;
-    const secondETA = info.secondGroup.estimatedTimeToReach;
-    lines.push(
-      `${dir}: density ${density} veh/km, total ${vols.total} vehicles; first ETA ${firstETA}s, second ETA ${secondETA}s`
-    );
+    Object.entries(status).forEach(([dir, info]) => {
+      const density = info.density || 0;
+      const vols = info.volumes || { total: 0 };
+      const firstETA = info.firstGroup?.estimatedTimeToReach || 0;
+      const secondETA = info.secondGroup?.estimatedTimeToReach || 0;
 
-    if (density >= 40 || vols.total >= 70)
-      suggestions.push(`${dir}: high density — consider reducing inflow or rerouting traffic`);
-    else if (density >= 25)
-      suggestions.push(`${dir}: moderate density — monitor speed and volumes`);
-    if (info.firstGroup.hasReached && !info.secondGroup.hasReached)
-      suggestions.push(`${dir}: first group has reached; you may accelerate the second group or clear the path`);
-  });
+      lines.push(
+        `${dir}: density ${density} veh/km, total ${vols.total} vehicles; first ETA ${firstETA}s, second ETA ${secondETA}s`,
+      );
 
-  let trafficSummary = `Traffic summary:\n${lines.join("\n")}`;
-  if (suggestions.length) trafficSummary += `\n\nSuggestions:\n- ${suggestions.join("\n- ")}`;
+      if (density >= 40 || vols.total >= 70) {
+        suggestions.push(`${dir}: high density — consider reducing inflow`);
+      } else if (density >= 25) {
+        suggestions.push(`${dir}: moderate density — monitor traffic`);
+      }
+    });
 
-  let reply = trafficSummary;
+    let reply = `📊 Traffic Summary:\n${lines.join("\n")}`;
+    if (suggestions.length) {
+      reply += `\n\n💡 Recommendations:\n- ${suggestions.join("\n- ")}`;
+    }
 
-  if (prompt && prompt.trim()) {
-    const lower = prompt.toLowerCase();
-    if (lower.includes("congestion") || lower.includes("traffic jam"))
-      reply = `🚨 Congestion Status:\n${lines.join("\n")}\n\n${trafficSummary}`;
+    if (prompt && prompt.toLowerCase().includes("congestion")) {
+      reply = `🚨 Congestion Alert:\n${lines.join("\n")}\n\n${reply}`;
+    }
+
+    console.log("🤖 AI Assistant processed request");
+    res.json({ reply, suggestions, traffic: status });
+  } catch (error) {
+    console.error("❌ AI error:", error);
+    res
+      .status(500)
+      .json({ reply: "Error processing request", error: error.message });
   }
-
-  res.json({ reply, suggestions, statusSnapshot: status });
 });
 
-// ✅ Start server only ONCE using Render's port
+// ============ SERVER START ==========
 server.listen(port, () => {
-  console.log(`Server running on http://localhost:${port}`);
-  console.log(`WebSocket server ready at ws://localhost:${port}`);
+  console.log(`\n${"=".repeat(50)}`);
+  console.log(`✅ SERVER STARTED`);
+  console.log(`📡 Express: http://localhost:${port}`);
+  console.log(`🔌 WebSocket: ws://localhost:${port}`);
+  console.log(`${"=".repeat(50)}\n`);
+});
+
+// Cleanup on shutdown
+process.on("SIGTERM", () => {
+  console.log("\n🛑 Shutting down...");
+  clearInterval(heartbeatInterval);
+  server.close(() => {
+    console.log("✅ Server closed");
+    process.exit(0);
+  });
 });
